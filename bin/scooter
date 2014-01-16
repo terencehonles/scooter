@@ -1,0 +1,160 @@
+#!/bin/bash
+
+function usage() {
+    echo "Usage: scooter STAGE COMMAND [ARG]..."
+}
+
+function scooter_not_configured() {
+    echo 'Are you sure scooter has been configured?'
+    echo
+    echo "I don't know how to refresh my cache files!"
+    echo "Please specify the refresh command with:"
+    echo '`git config --local scooter.refresh CMD_STRING'
+}
+
+function stage_missing() {
+    echo 'Are you sure stage "'"$STAGE"'" exists?'
+    echo
+    echo 'This stage seems to not be dependent on any files in your'
+    echo "repository, and I don't know how to verify if my cache is"
+    echo 'up to date! Please specify at least one dependency with:'
+    echo '`git config --local '"$STAGE_KEY"' ABSOLUTE_PATH`'
+}
+
+# main
+if (( $# < 1 )) ; then
+    usage >&2
+    exit 1
+fi
+
+REFRESH_CMD="$(git config --local scooter.refresh)"
+
+if (( $? != 0 )) ; then
+    scooter_not_configured >&2
+    exit 1
+fi
+
+DEBUG=false
+
+# parse scooter options
+while (( $# >= 1 )) ; do
+    case "$1" in
+        -d|--debug)
+            DEBUG=true
+            shift
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        *)
+            break
+            ;;
+    esac
+done
+
+export STAGE="$1"
+shift
+
+# determine if scooter's cache is up to date
+STAGE_KEY="scooter.stage-${STAGE}"
+CACHE_KEY=$(git config --local --null --get-all "${STAGE_KEY}" |
+            xargs -0 git rev-list --max-count=1 HEAD --)
+
+if [[ -z "$CACHE_KEY" ]] ; then
+    stage_missing >&2
+    exit 1
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+STAGE_DIR="${ROOT}/.scooter/${STAGE}"
+CACHE_FILENAME="${STAGE_DIR}/${CACHE_KEY}"
+
+if [[ ! -e "$CACHE_FILENAME" ]] ; then
+    mkdir -p "$STAGE_DIR"
+    echo >&2 "Dependent files have changed, refreshing cache"
+    echo >&2 "Running: "'`'"$REFRESH_CMD"'`'
+    eval $REFRESH_CMD > $CACHE_FILENAME
+
+    EXIT=$?
+
+    if (( $EXIT != 0 )) ; then
+        echo >&2 'Refresh did not complete successfully!'
+        echo >&2
+        echo >&2 "Exited with status code ${EXIT}"
+    fi
+fi
+
+# helper functions available to all scooter commands
+function all_hosts() {
+    cat "$CACHE_FILENAME"
+}
+export -f all_hosts
+
+function filtered_hosts() {
+    local suffix
+    if [[ "$1" == "-h" ]] ; then
+        suffix='{print $2}'
+        shift
+    fi
+
+    awk '$1 ~ /'"$1"'/'"$suffix" "$CACHE_FILENAME"
+}
+export -f filtered_hosts
+
+function default_args() {
+    git config --local "scooter.$1.args"
+}
+
+export -f default_args
+
+# builtin scooter commands
+function scooter_cmd_ssh() {
+    local machine
+
+    if [[ -z "$1" || "$1" == "--" ]] ; then
+        machine=($(all_hosts | head -n 1))
+    else
+        machine=($(filtered_hosts $1 | head -n 1))
+    fi
+    shift
+
+    $DEBUG && echo >&2 "Prepending default args to command string"
+    set -- $(default_args ssh) "$@"
+    echo >&2 "Connecting to ${machine[1]} (role: ${machine[0]})"
+    echo >&2 "ssh ${machine[1]}" "$@"
+
+    exec ssh "${machine[1]}" "$@"
+}
+
+# include all user defined commands
+for file in ~/.scooter/command.d/* "$ROOT/.scooter/command.d"/* ; do
+    if [[ -f "$file" ]] ; then
+        $DEBUG && echo >&2 "Including scooter extension ${file}"
+        source "$file"
+    fi
+done
+
+# execute scooter command
+case "$1" in
+    show|"")
+        case "$2" in
+            all|ALL|"") all_hosts ;;
+            *) filtered_hosts "$2" ;;
+        esac
+        ;;
+
+    *)
+        # check for a function matching the following pattern
+        method="scooter_cmd_$1"
+        if declare -F | grep -Fwq "$method" ; then
+            shift
+            "$method" "$@"
+        else
+            echo >&2 "Unknown command "'`'"$1"'`'
+            exit 2
+        fi
+        ;;
+esac
